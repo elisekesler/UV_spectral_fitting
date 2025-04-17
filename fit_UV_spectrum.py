@@ -2,15 +2,17 @@ import sys
 import csv
 from functools import partial
 import numpy as np
-from scipy.integrate import simps
+from scipy.integrate import simpson
 from astropy.table import vstack
 from astropy.io import fits
+import lmfit
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget,
     QFileDialog, QLabel, QHBoxLayout, QLineEdit, QProgressBar,
     QInputDialog, QMessageBox, QComboBox, QTableWidget,
     QTableWidgetItem
 )
+from astropy.stats import poisson_conf_interval as pcf
 from PyQt5.QtCore import QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
@@ -87,7 +89,6 @@ class SpectralFluxApp(QMainWindow):
         self.setGeometry(100, 100, 1000, 800)
 
     def init_variables(self):
-        # Initialize variables
         self.spectrum_data = []
         self.grating_data = []
         self.coadded_spectrum = None
@@ -95,6 +96,7 @@ class SpectralFluxApp(QMainWindow):
         self.redshift = 0.0
         self.selection_step = 0
         self.cid = None  # Connection ID for event handler
+        self.scale_value = 1e10 #value to scale the flux by
 
         self.line_wavelengths = np.array([0.0,
             1215.67, 1031.92, 1037.61, 1238.82, 1242.8,
@@ -135,10 +137,11 @@ class SpectralFluxApp(QMainWindow):
         self.load_button.clicked.connect(self.load_csv_with_fits_paths)
         self.controls_layout.addWidget(self.load_button)
 
-        # Co-add and plot button
-        self.coadd_button = QPushButton('Co-add and Plot')
-        self.coadd_button.clicked.connect(self.coadd_and_plot)
-        self.controls_layout.addWidget(self.coadd_button)
+        # # Co-add and plot button
+        # self.coadd_button = QPushButton('Co-add and Plot')
+        # self.coadd_button.clicked.connect(self.coadd_and_plot)
+        # self.controls_layout.addWidget(self.coadd_button)
+
 
         # Save Spectrum button
         self.save_button = QPushButton('Save Spectrum')
@@ -158,6 +161,14 @@ class SpectralFluxApp(QMainWindow):
         self.redshift_input = QLineEdit(self)
         self.redshift_input.setPlaceholderText("Enter redshift value")
         self.controls_layout.addWidget(self.redshift_input)
+
+        self.scale_label = QLabel('Scale by:')
+        self.scale_label.setWordWrap(True)
+        self.controls_layout.addWidget(self.scale_label)
+
+        self.scale_input = QLineEdit(self)
+        self.scale_input.setPlaceholderText(str(self.scale_value))
+        self.controls_layout.addWidget(self.scale_input)
 
         # Plot expected line locations button
         self.plot_lines_button = QPushButton('Plot Expected Line Locations')
@@ -309,9 +320,9 @@ class SpectralFluxApp(QMainWindow):
                     # Restore the co-added spectrum and redshift
                     self.coadded_spectrum = {
                         'wave': data['wave'],
-                        'flux': data['flux'],
-                        'error_up': data['error_up'],
-                        'error_down': data['error_down']
+                        'flux': data['flux']*self.scale_value,
+                        'error_up': data['error_up']*self.scale_value,
+                        'error_down': data['error_down']*self.scale_value
                     }
                     self.redshift = data['redshift']
                     self.redshift_input.setText(str(self.redshift))
@@ -324,9 +335,10 @@ class SpectralFluxApp(QMainWindow):
                     data = hdul[1].data
                     self.coadded_spectrum = {
                         'wave': data['Wavelength'],
-                        'flux': data['Flux'],
-                        'error_up': data['Error_Up'],
-                        'error_down': data['Error_Down']
+                        'flux': data['Flux']*self.scale_value,
+                        'error_up': data['Error_Up']*self.scale_value,
+                        'error_down': data['Error_Down']*self.scale_value,
+                        'counts': data['gcounts']
                     }
                     self.redshift = hdul[1].header['REDSHIFT']
                     self.redshift_input.setText(str(self.redshift))
@@ -356,25 +368,6 @@ class SpectralFluxApp(QMainWindow):
 
         self.redshift_input.setText(str(self.redshift))
 
-    def get_range_input(self, prompt):
-        """
-        Shows an input dialog for defining a wavelength range (low and high) for a grating.
-
-        :param prompt: The message to display in the dialog
-        :return: Tuple of (low, high) range in angstroms or None if input was canceled
-        """
-        try:
-            low, ok1 = QInputDialog.getDouble(self, prompt, "Low (Å):", 1200, 1000, 2000, 1)
-            if not ok1:
-                return None
-            high, ok2 = QInputDialog.getDouble(self, prompt, "High (Å):", 1400, 1000, 2000, 1)
-            if not ok2:
-                return None
-            return (low, high)
-        except Exception as e:
-            QMessageBox.warning(self, "Input Error", f"Error receiving range input: {e}")
-            return None
-
     def load_fits_files(self):
         self.spectrum_data = [self.load_and_prepare_fits(file_info) for file_info in self.fits_file_paths]
         if self.spectrum_data:
@@ -399,32 +392,6 @@ class SpectralFluxApp(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f'Error loading FITS file {file_name}: {e}')
             return None
-        
-    def coadd_and_plot(self):
-        if len(self.spectrum_data) > 0:
-            G140L_list = [data for data, grating in zip(self.spectrum_data, self.grating_data) if grating == 'G140L']
-            G130M_list = [data for data, grating in zip(self.spectrum_data, self.grating_data) if grating == 'G130M']
-
-            if G140L_list and G130M_list:  # Both G140L and G130M present
-                G130M_range = self.get_range_input("Define range for G130M:")
-                G140L_range = self.get_range_input("Define range for G140L:")
-
-                if not G130M_range or not G140L_range:
-                    self.statusBar().showMessage("Range input canceled.")
-                    return  # Exit if input was canceled
-
-                # Pass spectrum data, grating data, and the ranges to the worker
-                self.worker = CoaddWorker(self.spectrum_data, self.grating_data, G140L_range, G130M_range, self)
-            else:
-                # Pass spectrum data and grating data, no ranges required
-                self.worker = CoaddWorker(self.spectrum_data, self.grating_data, None, None, self)
-
-            self.worker.update_progress.connect(self.progress_bar.setValue)
-            self.worker.coadd_complete.connect(self.on_coadd_complete)
-            self.worker.start()
-            self.statusBar().showMessage('Co-adding and plotting...')
-        else:
-            self.statusBar().showMessage('No spectra loaded')
 
     def subtract_continuum_for_line(self, line_index):
         """Subtract the selected continuum for the given line and update the plot."""
@@ -480,7 +447,7 @@ class SpectralFluxApp(QMainWindow):
         # ax = self.figure.add_subplot(111)
         self.ax.plot(wave, self.flux_after_subtraction, label='Spectrum with Continuum Subtracted', color='blue')
         self.ax.set_xlabel('Wavelength')
-        self.ax.set_ylabel('Flux')
+        self.ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value})')
         self.canvas.draw()
 
     def undo_continuum_for_line(self, line_index):
@@ -497,7 +464,7 @@ class SpectralFluxApp(QMainWindow):
         ax = self.figure.add_subplot(111)
         ax.plot(wave, flux, label='Original Spectrum', color='black')
         ax.set_xlabel('Wavelength')
-        ax.set_ylabel('Flux')
+        ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value:0.2e})')
         self.canvas.draw()
 
         self.statusBar().showMessage(f'Continuum subtraction undone for line: {self.line_labels[line_index]}')
@@ -530,7 +497,7 @@ class SpectralFluxApp(QMainWindow):
             ax.set_xlim(1100, 1880)
             # print(np.max(flux[~np.isnan(flux)]))
             # ax.set_ylim(-0.5, np.max(flux[~np.isnan(flux)]))
-            ax.set_ylabel('Flux')
+            ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value:0.2e})')
             self.plot_expected_lines(ax)
             self.canvas.draw()
         else:
@@ -569,7 +536,7 @@ class SpectralFluxApp(QMainWindow):
                 ax.plot(wave, flux, label='Co-added Spectrum', color='black', drawstyle='steps-mid')
                 ax.plot(wave, (error_up + error_down)/2, color='grey', drawstyle='steps-mid')
                 ax.set_xlabel('Wavelength')
-                ax.set_ylabel('Flux')
+                ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value:0.2e})')
                 self.plot_expected_lines(ax)
                 self.canvas.draw()
             else:
@@ -586,7 +553,7 @@ class SpectralFluxApp(QMainWindow):
                 ax.set_xlim(zoom_range)
                 ax.set_ylim(0, np.max(flux_zoom[~np.isnan(flux_zoom)]) * 1.1)
                 ax.set_xlabel('Wavelength')
-                ax.set_ylabel('Flux')
+                ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value:0.2e})')
                 self.plot_expected_lines(ax)
                 self.canvas.draw()
         else:
@@ -705,61 +672,87 @@ class SpectralFluxApp(QMainWindow):
         self.canvas.draw()
 
     def calculate_flux_for_line(self):
-        table_row = self.current_line - 1
-        flux_value, flux_error = self.get_flux(
-            self.integration_start, self.integration_end,
-            self.left_continuum_start, self.left_continuum_end,
-            self.right_continuum_start, self.right_continuum_end
-        )
+        try:
+            table_row = self.current_line - 1
+            
+            # Get the flux and error values
+            print("About to calculate flux...")
+            flux_value, flux_error = self.get_flux(
+                self.integration_start, self.integration_end,
+                self.left_continuum_start, self.left_continuum_end,
+                self.right_continuum_start, self.right_continuum_end
+            )
+            print(f"Flux calculation returned: {flux_value}, {flux_error}")
 
-        if flux_value is None:
-            self.statusBar().showMessage(f'Flux calculation failed for {self.line_labels[self.current_line]}')
-            return
+            if flux_value is None:
+                self.statusBar().showMessage(f'Flux calculation failed for {self.line_labels[self.current_line]}')
+                return
 
-        # Display the calculated flux and error in the table
-        flux_item = QTableWidgetItem(f'{flux_value:.2e}')
-        self.table.setItem(table_row, 1, flux_item)
-        flux_error_item = QTableWidgetItem(f'{flux_error:.2e}')
-        self.table.setItem(table_row, 2, flux_error_item)
+            # Update the table with calculated values
+            flux_item = QTableWidgetItem(f'{flux_value:.2e}')
+            self.table.setItem(table_row, 1, flux_item)
+            flux_error_item = QTableWidgetItem(f'{flux_error:.2e}')
+            self.table.setItem(table_row, 2, flux_error_item)
 
-        # Display the continuum bounds in the respective table columns
-        self.table.setItem(table_row, 3, QTableWidgetItem(f'{self.left_continuum_start:.2f}'))
-        self.table.setItem(table_row, 4, QTableWidgetItem(f'{self.left_continuum_end:.2f}'))
-        self.table.setItem(table_row, 5, QTableWidgetItem(f'{self.right_continuum_start:.2f}'))
-        self.table.setItem(table_row, 6, QTableWidgetItem(f'{self.right_continuum_end:.2f}'))
+            # Update the table with continuum bounds
+            self.table.setItem(table_row, 3, QTableWidgetItem(f'{self.left_continuum_start:.2f}'))
+            self.table.setItem(table_row, 4, QTableWidgetItem(f'{self.left_continuum_end:.2f}'))
+            self.table.setItem(table_row, 5, QTableWidgetItem(f'{self.right_continuum_start:.2f}'))
+            self.table.setItem(table_row, 6, QTableWidgetItem(f'{self.right_continuum_end:.2f}'))
 
-        self.table.resizeColumnsToContents()
+            self.table.resizeColumnsToContents()
 
-        # Save current x and y limits to restore zoom level
-        x_limits = self.ax.get_xlim()
-        y_limits = self.ax.get_ylim()
-
-        # Re-plot the spectrum and overlays
-        self.ax.cla()
-        wave = self.coadded_spectrum['wave']
-        flux_full = self.coadded_spectrum['flux']
-        error_up = self.coadded_spectrum['error_up']
-        error_down = self.coadded_spectrum['error_down']
-        self.ax.plot(wave, flux_full, label='Co-added Spectrum', color='black', drawstyle='steps-mid')
-        self.ax.plot(wave, (error_up + error_down)/2, label='Error', color='grey', drawstyle='steps-mid')
-        self.ax.set_xlabel('Wavelength')
-        self.ax.set_ylabel('Flux')
-
-        # Re-plot overlays and restore zoom level
-        self.plot_continuum_region('left')
-        self.plot_continuum_region('right')
-        self.plot_integration_region()
-        self.plot_expected_lines(self.ax)
-
-        # Restore x and y limits
-        self.ax.set_xlim(x_limits)
-        self.ax.set_ylim(y_limits)
-
-        self.canvas.draw()
-
-        self.statusBar().showMessage(f'Calculated flux for {self.line_labels[self.current_line]}')
+            self.statusBar().showMessage(f'Calculated flux for {self.line_labels[self.current_line]}')
+        except Exception as e:
+            import traceback
+            print(f"Error in calculate_flux_for_line: {str(e)}")
+            print(traceback.format_exc())
+            self.statusBar().showMessage(f'Error calculating flux: {str(e)}')
 
 
+    def get_continuum(self, continuum_wave, continuum_flux, continuum_error, weights = None):
+        
+        print(f"Start of get_continuum")
+        
+        wavelength_array = continuum_wave
+
+        flux_array = continuum_flux
+        print(f'Successfully masked for continuum')
+        
+        if (weights == None):
+            weights = np.nan_to_num(1/(continuum_error))
+        
+        print(f'Weights worked')
+        def linear(x, m, b):
+            return x*m + b
+        
+
+        linear_model = lmfit.Model(linear)
+        print(f'linear model worked')
+        params_continuum = lmfit.Parameters()
+        params_continuum.add('m', value = (np.nanmean(flux_array)/2))
+        params_continuum.add('b', value = 0 )
+        nan_fluxes = 0.
+        total_fluxes = 0.
+        for flux in flux_array:
+            total_fluxes += 1
+            if np.isnan(flux):
+                nan_fluxes += 1
+        print(f'total fluxes: {total_fluxes}, nan fluxes: {nan_fluxes}')
+        try:
+            result = linear_model.fit(flux_array, x=wavelength_array, params=params_continuum, weights = weights)
+        except Exception as e:
+            print(f'Issue with result... error is: {e}')
+            result = None
+        print(f'Got result')
+        print(result.fit_report())
+        values = {}
+        values['slope'] = result.best_values['m']
+        values['intercept'] = result.best_values['b']
+        m = values['slope']
+        b = values['intercept'] 
+        # print(f'slope is {m}, intercept is {b}')
+        return values
     def get_flux(self, integ_start, integ_end, cont1_start, cont1_end, cont2_start, cont2_end):
         """
         Calculates the flux and flux error for a given spectral line.
@@ -790,12 +783,19 @@ class SpectralFluxApp(QMainWindow):
             wavelength_array = self.coadded_spectrum['wave']
             flux_array = self.coadded_spectrum['flux']
             error_array = (self.coadded_spectrum['error_up'] + self.coadded_spectrum['error_down']) / 2
-
+            counts_array = self.coadded_spectrum['counts']
+            print(f'Ranges successfully found')
             # Masks for the integration and continuum ranges
             integ_mask = (wavelength_array >= integ_start) & (wavelength_array <= integ_end)
             cont1_mask = (wavelength_array >= cont1_start) & (wavelength_array <= cont1_end)
             cont2_mask = (wavelength_array >= cont2_start) & (wavelength_array <= cont2_end)
 
+            cont_mask = ((wavelength_array >= cont2_start) & (wavelength_array <= cont2_end) | (wavelength_array >= cont2_start) & (wavelength_array <= cont2_end))
+            # Mask the flux and error arrays
+            flux_array_continuum = flux_array[cont_mask]
+            error_array_continuum = error_array[cont_mask]
+            wavelength_array_continuum = wavelength_array[cont_mask]
+            print(f'mask done')
             # Check for empty masks
             if not np.any(integ_mask):
                 self.statusBar().showMessage('No data in the selected integration range.')
@@ -805,50 +805,33 @@ class SpectralFluxApp(QMainWindow):
                 return None, None
 
             # Calculate continuum levels
-            cont1_flux = np.mean(flux_array[cont1_mask])
-            cont2_flux = np.mean(flux_array[cont2_mask])
-
-            # Calculate the slope and intercept of the continuum
-            cont1_center = np.mean(wavelength_array[cont1_mask])
-            cont2_center = np.mean(wavelength_array[cont2_mask])
-            slope = (cont2_flux - cont1_flux) / (cont2_center - cont1_center)
-            intercept = cont1_flux - slope * cont1_center
-
-            # Continuum model over integration range
-            continuum = slope * wavelength_array[integ_mask] + intercept
+            print(f'Finding continuum...')
+            continuum_values = self.get_continuum(wavelength_array_continuum, flux_array_continuum, error_array_continuum)
+            def linear(x, m, b):
+                return x*m + b
+            
+            slope = continuum_values['slope']
+            intercept = continuum_values['intercept']
+            print(f'slope is {slope:0.3f}, intercept is {intercept:0.3f}')
+            continuum = linear(wavelength_array, slope, intercept)
 
             # Subtract continuum from flux
-            flux_corrected = flux_array[integ_mask] - continuum
-
-            # Integrate the flux using Simpson's rule
-            flux = simps(flux_corrected, wavelength_array[integ_mask])
-
+            flux_corrected = flux_array[integ_mask] - continuum[integ_mask]
+            flux = simpson(flux_corrected, wavelength_array[integ_mask])
+            print(f"Calculated flux: {flux}, scaled by {self.scale_value}")
             # Estimate flux error
-            error_integ = error_array[integ_mask]
-            flux_error = np.sqrt(np.sum(error_integ**2)) * np.mean(np.diff(wavelength_array[integ_mask]))
-
-            # Clear current axes to prevent overplotting
-            self.ax.cla()
-
-            # Re-plot the spectrum
-            wave = self.coadded_spectrum['wave']
-            flux_full = self.coadded_spectrum['flux']
-            self.ax.plot(wave, flux_full, label='Co-added Spectrum', color='black', drawstyle='steps-mid')
-
-            # Plot the continuum and filled area
-            self.ax.plot(wavelength_array[integ_mask], continuum, label="Continuum", linestyle='--', color='orange')
-            self.ax.fill_between(wavelength_array[integ_mask], continuum, flux_array[integ_mask],
-                                 where=(flux_array[integ_mask] > continuum),
-                                 facecolor='red', alpha=0.5, interpolate=True)
-            self.ax.set_xlabel('Wavelength')
-            self.ax.set_ylabel('Flux')
-
-            # Re-plot selection overlays
-            self.plot_continuum_region('left')
-            self.plot_continuum_region('right')
-            self.plot_integration_region()
-            self.plot_expected_lines(self.ax)
-            self.canvas.draw()
+            counts_array = counts_array[integ_mask]
+            total_counts = np.sum(counts_array)
+            print(f'total counts worked')
+            poisson_conf = pcf(total_counts, interval = 'frequentist-confidence')
+            print(f'pcf worked')
+            gcounts_error_up = poisson_conf[1] - total_counts
+            gcounts_error_down = total_counts - poisson_conf[0] 
+            error_poisson_up = (gcounts_error_up/total_counts)*flux
+            error_poisson_down = (gcounts_error_down/total_counts)*flux
+            # error_integ = error_array[integ_mask]
+            flux_error = np.max([error_poisson_up, error_poisson_down])
+            print(f'found flux error in get_flux: {flux_error}')
 
             return flux, flux_error
         except Exception as e:
