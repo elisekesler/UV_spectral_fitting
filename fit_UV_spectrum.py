@@ -6,11 +6,12 @@ from scipy.integrate import simpson
 from astropy.table import vstack
 from astropy.io import fits
 import lmfit
+import os
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget,
     QFileDialog, QLabel, QHBoxLayout, QLineEdit, QProgressBar,
     QInputDialog, QMessageBox, QComboBox, QTableWidget,
-    QTableWidgetItem
+    QTableWidgetItem, QSizePolicy, QFrame
 )
 from astropy.stats import poisson_conf_interval as pcf
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -20,59 +21,6 @@ from matplotlib.backends.backend_qt5agg import (
 from matplotlib.figure import Figure
 from prepare_spec import coadd, prepare, prepare_other_grating, combine_tables
 import pickle
-
-#try pyqt for getting a separate plot window when zooming in or doing continuum
-#matplotlib.lines.Line2D can be saved as an object and later modified, could be good for replotting
-class CoaddWorker(QThread):
-    # This is here so it's possible to have a progress bar appear during coadding 
-    # Might be redundant code
-    update_progress = pyqtSignal(int)
-    coadd_complete = pyqtSignal(object)
-
-    def __init__(self, spectrum_data, grating_data, G140L_range=None, G130M_range=None, parent=None):
-        super().__init__(parent)
-        self.spectrum_data = spectrum_data
-        self.grating_data = grating_data
-        self.G140L_range = G140L_range  
-        self.G130M_range = G130M_range  
-        self.parent = parent  
-
-    def run(self):
-        try:
-            G140L_list = [data for data, grating in zip(self.spectrum_data, self.grating_data) if grating == 'G140L']
-            G130M_list = [data for data, grating in zip(self.spectrum_data, self.grating_data) if grating == 'G130M']
-
-            if G140L_list and G130M_list and self.G140L_range and self.G130M_range:
-                G140L_table = vstack(G140L_list)
-                G130M_table = vstack(G130M_list)
-
-                # Combine tables using the provided ranges
-                combined_table = combine_tables(
-                    G140L_table, G130M_table, 
-                    self.G140L_range[0], self.G130M_range[0], 
-                    self.G130M_range[0], self.G130M_range[1], 
-                    self.G130M_range[1], self.G140L_range[1]
-                )
-            elif G140L_list:
-                combined_table = vstack(G140L_list)
-            else:
-                combined_table = vstack(self.spectrum_data)
-
-            delta = 1
-
-            # Simulate progress updates
-            for i in range(1, 101):
-                self.update_progress.emit(i)
-                self.msleep(50)  # Simulate some delay for each step -- this is not a real progress bar sadly
-
-            coadded_spectrum = coadd(combined_table, delta)
-            self.coadd_complete.emit(coadded_spectrum)
-        except Exception as e:
-            print(f'Error while coadding: {e}')
-            self.statusBar().showMessage(f'Error while coadding: {e}')
-            self.coadd_complete.emit(None)
-
-
 
 class SpectralFluxApp(QMainWindow):
     # Main app with all the doohickeys and functionalities
@@ -84,9 +32,13 @@ class SpectralFluxApp(QMainWindow):
         self.create_plot_area()
         self.create_controls()
         self.create_table()
+        self.create_right_panel()  # Add this line
 
         self.setWindowTitle('Spectral Flux Measurement')
-        self.setGeometry(100, 100, 1000, 800)
+        self.setGeometry(100, 100, 1200, 800)  # Make the window a bit wider
+
+        # self.setWindowTitle('Spectral Flux Measurement')
+        # self.setGeometry(100, 100, 1000, 800)
 
     def init_variables(self):
         self.spectrum_data = []
@@ -96,7 +48,8 @@ class SpectralFluxApp(QMainWindow):
         self.redshift = 0.0
         self.selection_step = 0
         self.cid = None  # Connection ID for event handler
-        self.scale_value = 1e10 #value to scale the flux by
+        self.scale_value = 1e15 #value to scale the flux by
+        self.flux_method = "Direct Integration"
 
         self.line_wavelengths = np.array([0.0,
             1215.67, 1031.92, 1037.61, 1238.82, 1242.8,
@@ -119,7 +72,21 @@ class SpectralFluxApp(QMainWindow):
     def create_main_widget(self):
         self.main_widget = QWidget(self)
         self.setCentralWidget(self.main_widget)
-        self.main_layout = QVBoxLayout(self.main_widget)
+        
+        # Create a horizontal layout for the entire application
+        self.app_layout = QHBoxLayout(self.main_widget)
+        
+        # Create a vertical layout for the existing components (left side)
+        self.main_layout = QVBoxLayout()
+        self.app_layout.addLayout(self.main_layout)
+        
+        # Create a vertical layout for the new components (right side)
+        self.right_layout = QVBoxLayout()
+        self.app_layout.addLayout(self.right_layout)
+        
+        # Set the size ratio between left and right panels (2:1)
+        self.app_layout.setStretch(0, 2)
+        self.app_layout.setStretch(1, 1)
 
     def create_plot_area(self):
         self.figure = Figure(figsize=(10, 8))
@@ -159,7 +126,10 @@ class SpectralFluxApp(QMainWindow):
         self.controls_layout.addWidget(self.redshift_label)
 
         self.redshift_input = QLineEdit(self)
-        self.redshift_input.setPlaceholderText("Enter redshift value")
+        # self.redshift_input.setPlaceholderText("Enter redshift value")
+        self.redshift_input.setText(str(self.redshift))
+        self.redshift_input.returnPressed.connect(self.update_redshift)
+        self.redshift_input.setMinimumWidth(100)
         self.controls_layout.addWidget(self.redshift_input)
 
         self.scale_label = QLabel('Scale by:')
@@ -167,7 +137,10 @@ class SpectralFluxApp(QMainWindow):
         self.controls_layout.addWidget(self.scale_label)
 
         self.scale_input = QLineEdit(self)
-        self.scale_input.setPlaceholderText(str(self.scale_value))
+        # self.scale_input.setPlaceholderText(str(self.scale_value))
+        self.scale_input.setText(f'{self.scale_value:.2e}')
+        self.scale_input.returnPressed.connect(self.update_scale)
+        self.scale_input.setMinimumWidth(100)
         self.controls_layout.addWidget(self.scale_input)
 
         # Plot expected line locations button
@@ -196,12 +169,15 @@ class SpectralFluxApp(QMainWindow):
     def create_table(self):
         # Table to display flux and flux error for each line
         self.table = QTableWidget(self)
-        self.table.setColumnCount(10)
-        self.table.setHorizontalHeaderLabels(['Line', 'Flux', 'Flux Error', 
-                                            'Left Lower', 'Left Upper', 
-                                            'Right Lower', 'Right Upper', 
-                                            'Action', 'Subtract Continuum', 'Undo'])
-        self.table.setRowCount(len(self.line_labels))
+        self.table.setColumnCount(10)  # Reduced from 10 to 7 columns
+        self.table.setHorizontalHeaderLabels([
+            'Line', 'Flux', 'Flux Error', 
+            'Left Lower', 'Left Upper', 
+            'Right Lower', 'Right Upper',
+            'Continuum Slope', 'Continuum Intercept',
+            'Gaussian Fit File'
+        ])
+        self.table.setRowCount(len(self.line_labels) - 1)  # Skip 'Full Spectrum'
 
         # Populate the table
         for i, line_label in enumerate(self.line_labels[1:]):
@@ -212,25 +188,192 @@ class SpectralFluxApp(QMainWindow):
             self.table.setItem(i, 4, QTableWidgetItem(''))  # Left upper bound
             self.table.setItem(i, 5, QTableWidgetItem(''))  # Right lower bound
             self.table.setItem(i, 6, QTableWidgetItem(''))  # Right upper bound
-
-            # "Find Flux and Error" button
-            find_flux_error_button = QPushButton('Find Flux and Error')
-            find_flux_error_button.clicked.connect(partial(self.find_flux_for_line, i + 1))
-            self.table.setCellWidget(i, 7, find_flux_error_button)
-
-            # "Subtract Continuum" button
-            subtract_button = QPushButton('Subtract Continuum')
-            subtract_button.clicked.connect(partial(self.subtract_continuum_for_line, i + 1))
-            self.table.setCellWidget(i, 8, subtract_button)
-
-            # "Undo Continuum" button
-            undo_button = QPushButton('Undo Continuum')
-            undo_button.clicked.connect(partial(self.undo_continuum_for_line, i + 1))
-            self.table.setCellWidget(i, 9, undo_button)
+            self.table.setItem(i, 7, QTableWidgetItem(''))  # Continuum Slope
+            self.table.setItem(i, 8, QTableWidgetItem(''))  # Continuum Intercept
+            self.table.setItem(i, 9, QTableWidgetItem(''))  # Gaussian fit file (if applicable)
 
         self.main_layout.addWidget(self.table)
         self.table.resizeColumnsToContents()
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
+        # Connect the row selection signal
+        self.table.itemSelectionChanged.connect(self.on_table_selection_change)
 
+    def on_table_selection_change(self):
+        # Get the selected row(s)
+        selected_rows = self.table.selectionModel().selectedRows()
+        if selected_rows:
+            row_index = selected_rows[0].row()
+            # Get the line label from the first column
+            line_item = self.table.item(row_index, 0)
+            if line_item:
+                line_label = line_item.text()
+                # Update the display label
+                self.selected_line_display.setText(line_label)
+                # Find the matching index in line_labels (add 1 because we skip 'Full Spectrum')
+                self.current_line = self.line_labels.index(line_label)
+                # Enable the action buttons
+                self.action_button.setEnabled(True)
+                self.subtract_continuum_button.setEnabled(True)
+                self.undo_button.setEnabled(True)
+
+    def update_line_values_from_object_row(self, row_index):
+        """Update the line values in the left table from the selected row in the objects table"""
+        # Map column indices to line names and their corresponding row in the left table
+        line_mappings = {
+            "Lya": (1, 0),       # (Column in objects table, Row in left table)
+            "Lya_err": (2, 0),
+            "OVI": (3, 1),       # OVI corresponds to the second row in the left table
+            "OVI_err": (4, 1),
+            "CIV": (5, 3),       # CIV corresponds to the fourth row in the left table
+            "CIV_err": (6, 3),
+            "NV": (7, 2),        # NV corresponds to the third row in the left table
+            "NV_err": (8, 2)
+        }
+        
+        # Update each line value
+        for line_name, (obj_col, left_row) in line_mappings.items():
+            value_item = self.objects_table.item(row_index, obj_col)
+            if value_item and value_item.text():
+                # Determine if this is a flux or error value
+                left_col = 1 if "_err" not in line_name else 2
+                # Update the value in the left table
+                self.table.setItem(left_row, left_col, QTableWidgetItem(value_item.text()))
+    def action_on_selected_line(self):
+        # Get the flux method
+        flux_method = self.flux_method_dropdown.currentText()
+        
+        # Depending on the method, call the appropriate function
+        if flux_method == "Direct Integration":
+            self.find_flux_for_line(self.current_line)
+        else:  # "Gaussian Fit"
+            # This would be a new method you'd need to implement
+            self.fit_gaussian_for_line(self.current_line)
+
+    def subtract_continuum_on_selected_line(self):
+        self.subtract_continuum_for_line(self.current_line)
+
+    def undo_continuum_on_selected_line(self):
+        self.undo_continuum_for_line(self.current_line)
+
+    def fit_gaussian_for_line(self, line_index):
+        # This is a placeholder for the Gaussian fitting functionality
+        self.statusBar().showMessage(f"Gaussian fitting not yet implemented for {self.line_labels[line_index]}")
+        # jj implement the Gaussian fitting here
+    def create_right_panel(self):
+        # Create a table for object data
+        self.objects_table = QTableWidget()
+        self.objects_table.setColumnCount(11)
+        self.objects_table.setHorizontalHeaderLabels([
+            "Object Name", "Lya", "Lya_err", "OVI", "OVI_err", 
+            "CIV", "CIV_err", "NV", "NV_err", "Object_csv", "Object_fits"
+        ])
+        
+        # Make the table take up most of the right panel
+        self.right_layout.addWidget(self.objects_table)
+        
+        # Connect the selection signal
+        self.objects_table.itemSelectionChanged.connect(self.on_object_selection_change)
+        
+        # Create a horizontal layout for the buttons
+        button_layout = QHBoxLayout()
+        
+        # Add the "load csv" button
+        self.load_csv_button = QPushButton("Load CSV")
+        self.load_csv_button.clicked.connect(self.load_objects_csv)
+        button_layout.addWidget(self.load_csv_button)
+        
+        # Add the "save csv" button
+        self.save_csv_button = QPushButton("Save CSV")
+        self.save_csv_button.clicked.connect(self.save_objects_csv)
+        button_layout.addWidget(self.save_csv_button)
+        
+        # Add the button layout to the right panel
+        self.right_layout.addLayout(button_layout)
+        
+        self.create_detailed_controls()
+        
+        # Set the stretch factors to make the table take up most of the space
+        self.right_layout.setStretch(0, 4)  # Table gets most space
+        self.right_layout.setStretch(1, 1)  # Buttons get less space
+        self.right_layout.setStretch(2, 2)  # Detailed controls get more space
+
+    def on_object_selection_change(self):
+        # Get the selected row
+        selected_rows = self.objects_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+            
+        row_index = selected_rows[0].row()
+        
+        # Get the csv and fits file paths
+        csv_item = self.objects_table.item(row_index, 9)  # Object_csv column
+        fits_item = self.objects_table.item(row_index, 10)  # Object_fits column
+        
+        if not csv_item or not fits_item:
+            return
+            
+        csv_path = csv_item.text()
+        fits_path = fits_item.text()
+        
+        # Check if the paths exist
+        if os.path.exists(csv_path) and os.path.exists(fits_path):
+            # Load the CSV file (which should contain redshift info and possibly other metadata)
+            self.load_csv(csv_path)
+            
+            # Load the spectrum from the fits file
+            self.load_spectrum_from_path(fits_path)
+            
+            # Update the line values in the table
+            self.update_line_values_from_object_row(row_index)
+
+    def load_spectrum_from_path(self, fits_path):
+        """Load a spectrum directly from a fits file path"""
+        try:
+            if fits_path.endswith('.fits'):
+                # Load the spectrum from the FITS file
+                hdul = fits.open(fits_path)
+                data = hdul[1].data
+                self.coadded_spectrum = {
+                    'wave': data['Wavelength'],
+                    'flux': data['Flux']*self.scale_value,
+                    'error_up': data['Error_Up']*self.scale_value,
+                    'error_down': data['Error_Down']*self.scale_value,
+                    'counts': data.get('gcounts', np.zeros_like(data['Wavelength']))  # Fallback if not present
+                }
+                
+                # Try to get redshift from header
+                try:
+                    self.redshift = hdul[1].header.get('REDSHIFT', self.redshift)
+                    self.redshift_input.setText(str(self.redshift))
+                except:
+                    pass
+                    
+                hdul.close()
+                
+                self.plot_spectrum()
+                self.statusBar().showMessage(f'Spectrum loaded from {fits_path}')
+            elif fits_path.endswith('.npz'):
+                # Load the spectrum data from the NPZ file
+                data = np.load(fits_path)
+
+                # Restore the co-added spectrum and redshift
+                self.coadded_spectrum = {
+                    'wave': data['wave'],
+                    'flux': data['flux']*self.scale_value,
+                    'error_up': data['error_up']*self.scale_value,
+                    'error_down': data['error_down']*self.scale_value,
+                    'counts': data.get('counts', np.zeros_like(data['wave']))  # Fallback if not present
+                }
+                self.redshift = data['redshift']
+                self.redshift_input.setText(str(self.redshift))
+
+                self.plot_spectrum()
+                self.statusBar().showMessage(f'Spectrum loaded from {fits_path}')
+            else:
+                self.statusBar().showMessage('Unsupported file format.')
+        except Exception as e:
+            self.statusBar().showMessage(f'Error loading spectrum: {e}')
     def load_csv_with_fits_paths(self):
         options = QFileDialog.Options()
         csv_file, _ = QFileDialog.getOpenFileName(
@@ -239,6 +382,124 @@ class SpectralFluxApp(QMainWindow):
         if csv_file:
             self.load_csv(csv_file)
 
+    def load_objects_csv(self):
+        options = QFileDialog.Options()
+        csv_file, _ = QFileDialog.getOpenFileName(
+            self, "Open Objects CSV File", "", "CSV Files (*.csv);;All Files (*)", options=options
+        )
+        if csv_file:
+            try:
+                with open(csv_file, 'r') as file:
+                    import csv
+                    reader = csv.reader(file)
+                    header = next(reader)  # Skip header row
+                    
+                    # Clear the table
+                    self.objects_table.setRowCount(0)
+                    
+                    # Add rows to the table
+                    for row_num, row_data in enumerate(reader):
+                        self.objects_table.insertRow(row_num)
+                        for col_num, data in enumerate(row_data):
+                            item = QTableWidgetItem(data)
+                            self.objects_table.setItem(row_num, col_num, item)
+                    
+                self.statusBar().showMessage(f'Loaded objects CSV: {csv_file}')
+            except Exception as e:
+                self.statusBar().showMessage(f'Error loading objects CSV: {e}')
+
+    def create_detailed_controls(self):
+        # Create a frame with a border for the detailed controls
+        self.detailed_controls_frame = QFrame()
+        self.detailed_controls_frame.setFrameShape(QFrame.StyledPanel)
+        self.detailed_controls_frame.setFrameShadow(QFrame.Raised)
+        self.detailed_controls_frame.setMinimumHeight(200)
+    
+        # Create a layout for the detailed controls
+        detailed_layout = QVBoxLayout(self.detailed_controls_frame)
+        
+        # Add "Selected line:" label and value display
+        line_selection_layout = QHBoxLayout()
+        line_selection_label = QLabel("Selected line:")
+        line_selection_layout.addWidget(line_selection_label)
+        
+        self.selected_line_display = QLabel("None")
+        self.selected_line_display.setStyleSheet("font-weight: bold;")
+        line_selection_layout.addWidget(self.selected_line_display)
+        line_selection_layout.addStretch()
+        
+        detailed_layout.addLayout(line_selection_layout)
+        
+        # Add "Flux method:" label and dropdown
+        method_layout = QHBoxLayout()
+        method_label = QLabel("Flux method:")
+        method_layout.addWidget(method_label)
+        
+        self.flux_method_dropdown = QComboBox()
+        self.flux_method_dropdown.addItems(["Direct Integration", "Gaussian Fit"])
+        method_layout.addWidget(self.flux_method_dropdown)
+        method_layout.addStretch()
+    
+        detailed_layout.addLayout(method_layout)
+        
+        # Add the action buttons in a horizontal layout
+        buttons_layout = QHBoxLayout()
+        
+        self.action_button = QPushButton("Find Flux and Error")
+        self.action_button.clicked.connect(self.action_on_selected_line)
+        buttons_layout.addWidget(self.action_button)
+        
+        self.subtract_continuum_button = QPushButton("Subtract Continuum")
+        self.subtract_continuum_button.clicked.connect(self.subtract_continuum_on_selected_line)
+        buttons_layout.addWidget(self.subtract_continuum_button)
+        
+        self.undo_button = QPushButton("Undo Continuum")
+        self.undo_button.clicked.connect(self.undo_continuum_on_selected_line)
+        buttons_layout.addWidget(self.undo_button)
+        
+        detailed_layout.addLayout(buttons_layout)
+        
+        # Add spacing at the bottom
+        detailed_layout.addStretch()
+        
+        # Add the frame to the right layout
+        self.right_layout.addWidget(self.detailed_controls_frame)
+        
+        # Initially disable the buttons until a line is selected
+        self.action_button.setEnabled(False)
+        self.subtract_continuum_button.setEnabled(False)
+        self.undo_button.setEnabled(False)
+    def save_objects_csv(self):
+        options = QFileDialog.Options()
+        csv_file, _ = QFileDialog.getSaveFileName(
+            self, "Save Objects CSV", "", "CSV Files (*.csv);;All Files (*)", options=options
+        )
+        if csv_file:
+            try:
+                with open(csv_file, 'w', newline='') as file:
+                    import csv
+                    writer = csv.writer(file)
+                    
+                    # Write header
+                    headers = []
+                    for col in range(self.objects_table.columnCount()):
+                        headers.append(self.objects_table.horizontalHeaderItem(col).text())
+                    writer.writerow(headers)
+                    
+                    # Write data
+                    for row in range(self.objects_table.rowCount()):
+                        row_data = []
+                        for col in range(self.objects_table.columnCount()):
+                            item = self.objects_table.item(row, col)
+                            if item is not None:
+                                row_data.append(item.text())
+                            else:
+                                row_data.append('')
+                        writer.writerow(row_data)
+                    
+                self.statusBar().showMessage(f'Saved objects CSV: {csv_file}')
+            except Exception as e:
+                self.statusBar().showMessage(f'Error saving objects CSV: {e}')
     def load_csv(self, csv_file_path):
         try:
             with open(csv_file_path, 'r') as csvfile:
@@ -264,6 +525,29 @@ class SpectralFluxApp(QMainWindow):
             self.load_fits_files()
         except Exception as e:
             self.statusBar().showMessage(f'Error loading CSV: {e}')
+
+    def update_redshift(self):
+        try:
+            new_redshift = float(self.redshift_input.text())
+            self.redshift = new_redshift
+            self.statusBar().showMessage(f'Redshift updated to {self.redshift}')
+            if self.coadded_spectrum:
+                self.plot_spectrum()
+        except ValueError:
+            self.statusBar().showMessage('Invalid redshift value')
+            self.redshift_input.setText(str(self.redshift))
+
+    def update_scale(self):
+        try:
+            new_scale = float(self.scale_input.text())
+            self.scale_value = new_scale
+            self.statusBar().showMessage(f'Scale value updated to {self.scale_value:.2e}')
+            self.scale_input.setText(f"{self.scale_value:.2e}")  # Update with scientific notation
+            if self.coadded_spectrum:
+                self.plot_spectrum()
+        except ValueError:
+            self.statusBar().showMessage('Invalid scale value')
+            self.scale_input.setText(f"{self.scale_value:.2e}")  # Revert with scientific notation
 
     def save_spectrum(self):
         if self.coadded_spectrum is None:
@@ -297,11 +581,86 @@ class SpectralFluxApp(QMainWindow):
                     hdu.header['REDSHIFT'] = self.redshift
                     hdu.writeto(save_file, overwrite=True)
                     self.statusBar().showMessage(f'Spectrum saved to {save_file}')
-                else:
-                    self.statusBar().showMessage('Unsupported file format.')
-
+                self.update_objects_table_with_saved_spectrum(save_file)
+                
             except Exception as e:
                 self.statusBar().showMessage(f'Error saving spectrum: {e}')
+
+    def update_objects_table_with_saved_spectrum(self, fits_path):
+        """Update the objects table with the saved spectrum"""
+        # Check if there's a selected row
+        selected_rows = self.objects_table.selectionModel().selectedRows()
+        
+        if selected_rows:
+            # Update the existing row
+            row_index = selected_rows[0].row()
+            self.objects_table.setItem(row_index, 10, QTableWidgetItem(fits_path))
+            
+            # Update the flux values from the left table
+            self.update_object_row_from_line_values(row_index)
+        else:
+            # Add a new row
+            self.add_new_object_row(fits_path)
+
+    def update_object_row_from_line_values(self, row_index):
+        """Update the flux values in the objects table from the left table"""
+        # Map line names to their corresponding column in the objects table and row in the left table
+        line_mappings = {
+            "Lya": (1, 0),       # (Column in objects table, Row in left table)
+            "Lya_err": (2, 0),
+            "OVI": (3, 1),
+            "OVI_err": (4, 1),
+            "CIV": (5, 3),
+            "CIV_err": (6, 3),
+            "NV": (7, 2),
+            "NV_err": (8, 2)
+        }
+        
+        # Update each value
+        for line_name, (obj_col, left_row) in line_mappings.items():
+            # Determine if this is a flux or error value
+            left_col = 1 if "_err" not in line_name else 2
+            # Get value from left table
+            item = self.table.item(left_row, left_col)
+            if item and item.text():
+                self.objects_table.setItem(row_index, obj_col, QTableWidgetItem(item.text()))
+    # def save_spectrum(self):
+    #     if self.coadded_spectrum is None:
+    #         self.statusBar().showMessage('No co-added spectrum to save.')
+    #         return
+
+    #     # Get the save file path
+    #     options = QFileDialog.Options()
+    #     save_file, _ = QFileDialog.getSaveFileName(
+    #         self, "Save Spectrum", "", "FITS Files (*.fits);;NPZ Files (*.npz);;All Files (*)", options=options
+    #     )
+
+    #     if save_file:
+    #         try:
+    #             if save_file.endswith('.npz'):
+    #                 # Save the co-added spectrum and redshift as an NPZ file
+    #                 np.savez(save_file, wave=self.coadded_spectrum['wave'], 
+    #                         flux=self.coadded_spectrum['flux'],
+    #                         error_up=self.coadded_spectrum['error_up'],
+    #                         error_down=self.coadded_spectrum['error_down'],
+    #                         redshift=self.redshift)
+    #                 self.statusBar().showMessage(f'Spectrum saved to {save_file}')
+    #             elif save_file.endswith('.fits'):
+    #                 # Save the spectrum as a FITS file
+    #                 col1 = fits.Column(name='Wavelength', format='E', array=self.coadded_spectrum['wave'])
+    #                 col2 = fits.Column(name='Flux', format='E', array=self.coadded_spectrum['flux'])
+    #                 col3 = fits.Column(name='Error_Up', format='E', array=self.coadded_spectrum['error_up'])
+    #                 col4 = fits.Column(name='Error_Down', format='E', array=self.coadded_spectrum['error_down'])
+
+    #                 hdu = fits.BinTableHDU.from_columns([col1, col2, col3, col4])
+    #                 hdu.header['REDSHIFT'] = self.redshift
+    #                 hdu.writeto(save_file, overwrite=True)
+    #                 self.statusBar().showMessage(f'Spectrum saved to {save_file}')
+    #             else:
+    #                 self.statusBar().showMessage('Unsupported file format.')
+
+    #         except Exception as e:
+    #             self.statusBar().showMessage(f'Error saving spectrum: {e}')
 
 
     def load_spectrum(self):
@@ -326,6 +685,7 @@ class SpectralFluxApp(QMainWindow):
                     }
                     self.redshift = data['redshift']
                     self.redshift_input.setText(str(self.redshift))
+                    
 
                     self.plot_spectrum()
                     self.statusBar().showMessage(f'Spectrum loaded from {load_file}')
@@ -351,7 +711,6 @@ class SpectralFluxApp(QMainWindow):
                 self.statusBar().showMessage(f'Error loading spectrum: {e}')
 
 
-
     def confirm_redshift(self):
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle('Redshift Confirmation')
@@ -365,8 +724,11 @@ class SpectralFluxApp(QMainWindow):
             )
             if ok:
                 self.redshift = redshift
-
-        self.redshift_input.setText(str(self.redshift))
+                self.redshift_input.setText(str(self.redshift))
+                if self.coadded_spectrum:
+                    self.plot_spectrum()
+        else:
+            self.redshift_input.setText(str(self.redshift))
 
     def load_fits_files(self):
         self.spectrum_data = [self.load_and_prepare_fits(file_info) for file_info in self.fits_file_paths]
@@ -401,25 +763,25 @@ class SpectralFluxApp(QMainWindow):
         left_upper = self.table.item(table_row, 4).text()
         right_lower = self.table.item(table_row, 5).text()
         right_upper = self.table.item(table_row, 6).text()
+        slope = self.table.item(table_row, 7).text()
+        intercept = self.table.item(table_row, 8).text()
 
         if not (left_lower and left_upper and right_lower and right_upper):
             self.statusBar().showMessage('Continuum bounds are not set for this line.')
             return
 
         try:
-            left_lower = float(left_lower)
-            left_upper = float(left_upper)
-            right_lower = float(right_lower)
-            right_upper = float(right_upper)
+            slope = float(slope)
+            intercept = float(intercept)
 
             # Subtract the continuum using the bounds from the table and plot the new spectrum
-            self.apply_continuum_subtraction(left_lower, left_upper, right_lower, right_upper)
+            self.apply_continuum_subtraction(slope, intercept)
             self.statusBar().showMessage(f'Continuum subtracted for line: {self.line_labels[line_index]}')
         except ValueError:
             self.statusBar().showMessage('Invalid continuum bounds input.')
 
 
-    def apply_continuum_subtraction(self, left_lower, left_upper, right_lower, right_upper):
+    def apply_continuum_subtraction(self, slope, intercept):
         """Perform the continuum subtraction and update the plot."""
         if self.coadded_spectrum is None:
             self.statusBar().showMessage('No co-added spectrum to subtract continuum.')
@@ -428,17 +790,17 @@ class SpectralFluxApp(QMainWindow):
         wave = self.coadded_spectrum['wave']
         flux = self.coadded_spectrum['flux']
 
-        # Create masks for the continuum regions
-        left_mask = (wave >= left_lower) & (wave <= left_upper)
-        right_mask = (wave >= right_lower) & (wave <= right_upper)
+        # # Create masks for the continuum regions
+        # left_mask = (wave >= left_lower) & (wave <= left_upper)
+        # right_mask = (wave >= right_lower) & (wave <= right_upper)
 
-        # Calculate the continuum levels
-        left_flux = np.mean(flux[left_mask])
-        right_flux = np.mean(flux[right_mask])
+        # # Calculate the continuum levels
+        # left_flux = np.mean(flux[left_mask])
+        # right_flux = np.mean(flux[right_mask])
 
-        # Linear continuum between the two regions
-        continuum = np.interp(wave, [left_lower, right_upper], [left_flux, right_flux])
-
+        # # Linear continuum between the two regions
+        # continuum = np.interp(wave, [left_lower, right_upper], [left_flux, right_flux])
+        continuum = slope * wave + intercept
         # Subtract the continuum from the flux
         self.flux_after_subtraction = flux - continuum
 
@@ -456,18 +818,19 @@ class SpectralFluxApp(QMainWindow):
             self.statusBar().showMessage('No co-added spectrum to undo.')
             return
 
-        wave = self.coadded_spectrum['wave']
-        flux = self.coadded_spectrum['flux']
+        # wave = self.coadded_spectrum['wave']
+        # flux = self.coadded_spectrum['flux']
 
-        # Restore the original spectrum
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
-        ax.plot(wave, flux, label='Original Spectrum', color='black')
-        ax.set_xlabel('Wavelength')
-        ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value:0.2e})')
-        self.canvas.draw()
+        # # Restore the original spectrum
+        # self.figure.clear()
+        # ax = self.figure.add_subplot(111)
+        # ax.plot(wave, flux, label='Original Spectrum', color='black')
+        # ax.set_xlabel('Wavelength')
+        # ax.set_ylabel(f'Flux (erg / s / cm^2 / A ) (scaled by {self.scale_value:0.2e})')
+        # self.canvas.draw()
 
-        self.statusBar().showMessage(f'Continuum subtraction undone for line: {self.line_labels[line_index]}')
+        #self.statusBar().showMessage(f'Continuum subtraction undone for line: {self.line_labels[line_index]}')
+        self.statusBar().showMessage(f'This is buggy... cut for now. Sorry!!')
 
 
     def on_coadd_complete(self, coadded_spectrum):
@@ -677,7 +1040,7 @@ class SpectralFluxApp(QMainWindow):
             
             # Get the flux and error values
             print("About to calculate flux...")
-            flux_value, flux_error = self.get_flux(
+            flux_value, flux_error, cont_slope, cont_intercept = self.get_flux(
                 self.integration_start, self.integration_end,
                 self.left_continuum_start, self.left_continuum_end,
                 self.right_continuum_start, self.right_continuum_end
@@ -699,6 +1062,8 @@ class SpectralFluxApp(QMainWindow):
             self.table.setItem(table_row, 4, QTableWidgetItem(f'{self.left_continuum_end:.2f}'))
             self.table.setItem(table_row, 5, QTableWidgetItem(f'{self.right_continuum_start:.2f}'))
             self.table.setItem(table_row, 6, QTableWidgetItem(f'{self.right_continuum_end:.2f}'))
+            self.table.setItem(table_row, 7, QTableWidgetItem(f'{cont_slope:.2e}'))
+            self.table.setItem(table_row, 8, QTableWidgetItem(f'{cont_intercept:.2e}'))
 
             self.table.resizeColumnsToContents()
 
@@ -751,6 +1116,7 @@ class SpectralFluxApp(QMainWindow):
         values['intercept'] = result.best_values['b']
         m = values['slope']
         b = values['intercept'] 
+
         # print(f'slope is {m}, intercept is {b}')
         return values
     def get_flux(self, integ_start, integ_end, cont1_start, cont1_end, cont2_start, cont2_end):
@@ -833,7 +1199,7 @@ class SpectralFluxApp(QMainWindow):
             flux_error = np.max([error_poisson_up, error_poisson_down])
             print(f'found flux error in get_flux: {flux_error}')
 
-            return flux, flux_error
+            return flux, flux_error, slope, intercept
         except Exception as e:
             self.statusBar().showMessage(f'Error calculating flux: {e}')
             return None, None
@@ -844,3 +1210,4 @@ if __name__ == "__main__":
     main_win = SpectralFluxApp()
     main_win.show()
     sys.exit(app.exec_())
+
